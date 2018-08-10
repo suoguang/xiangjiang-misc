@@ -1,0 +1,52 @@
+diff --git a/bin/guest/pkg/linux_guest/mklinux.sh b/bin/guest/pkg/linux_guest/mklinux.sh
+index 3a174b2..2a2bfe8 100755
+--- a/bin/guest/pkg/linux_guest/mklinux.sh
++++ b/bin/guest/pkg/linux_guest/mklinux.sh
+@@ -47,12 +47,17 @@ declare -r LINUX_DIR=${LINUX_DIR:-/tmp/linux}
+ 
+ # Shallow clone the repository.
+ if [ ! -d "${LINUX_DIR}/.git" ]; then
+-  git clone --depth 1 https://zircon-guest.googlesource.com/third_party/linux "${LINUX_DIR}"
++  echo
++  echo $LINUX_DIR
++  echo
++  mkdir -p $LINUX_DIR
++  cp -rf ~/guest-tmp/linux/* $LINUX_DIR 
++  #git clone --depth 1 https://zircon-guest.googlesource.com/third_party/linux "${LINUX_DIR}"
+ fi
+ 
+ # Update the repository.
+ cd "${LINUX_DIR}"
+-git pull
++#git pull
+ # Build Linux.
+ make machina_defconfig
+ make -j $(getconf _NPROCESSORS_ONLN)
+diff --git a/bin/guest/pkg/linux_guest/mksysroot.sh b/bin/guest/pkg/linux_guest/mksysroot.sh
+index f555830..8b509e7 100755
+--- a/bin/guest/pkg/linux_guest/mksysroot.sh
++++ b/bin/guest/pkg/linux_guest/mksysroot.sh
+@@ -34,7 +34,10 @@ get_toybox_source() {
+   local toybox_src=$1
+ 
+   if [ ! -d "$toybox_src" ]; then
+-    git clone --depth 1 https://zircon-guest.googlesource.com/third_party/toybox "$toybox_src"
++    echo $toybox_src
++    mkdir -p $toybox_src
++    cp -rf ~/guest-tmp/toybox/* $toybox_src
++    #git clone --depth 1 https://zircon-guest.googlesource.com/third_party/toybox "$toybox_src"
+   fi
+ }
+ 
+@@ -60,7 +63,10 @@ get_dash_source() {
+   local dash_src=$1
+ 
+   if [ ! -d "$dash_src" ]; then
+-    git clone --depth 1 https://zircon-guest.googlesource.com/third_party/dash "$dash_src"
++    echo $dash_src
++    mkdir -p $dash_src
++    cp -rf ~/guest-tmp/dash/* $dash_src
++    #git clone --depth 1 https://zircon-guest.googlesource.com/third_party/dash "$dash_src"
+   fi
+ }
+ 
