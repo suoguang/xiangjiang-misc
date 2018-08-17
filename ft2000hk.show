@@ -1,0 +1,812 @@
+commit 5b7e1f91871bf03251118359362c8678b0e99bb6
+Author: suoguang <suoguang@163.com>
+Date:   Fri Aug 17 17:58:03 2018 +0800
+
+    boot zircon uImage on ft2000hk (using ft1500_cmd.sh to generate uimage), boot zircon uImage on odroidc2 (using ./scripts/build-bootable-odroidc2-sdcard.sh)
+
+diff --git a/ft1500_cmd.sh b/ft1500_cmd.sh
+new file mode 100755
+index 0000000..ab7c1d7
+--- /dev/null
++++ b/ft1500_cmd.sh
+@@ -0,0 +1,7 @@
++#!/bin/bash
++
++mkimage -n 'zircon-ft1500hk' -A arm64 -O linux -T kernel -C none -a 0x90280000 -e 0x90280000 -d build-arm64/ft1500hk-zircon-bootimage.bin  build-arm64/ft1500hk-zircon-bootimage.bin.img
++sudo mount /dev/sdb1 /mnt
++sudo cp build-arm64/ft1500hk-zircon-bootimage.bin.img /mnt/
++sudo umount /mnt
++
+diff --git a/kernel/arch/arm64/feature.cpp b/kernel/arch/arm64/feature.cpp
+index 7dc6d01..af81a57 100644
+--- a/kernel/arch/arm64/feature.cpp
++++ b/kernel/arch/arm64/feature.cpp
+@@ -135,6 +135,9 @@ static void midr_to_core(uint32_t midr, char* str, size_t len) {
+     } else if (implementer == 'C' && partnum == 0xa1) {
+         // Cavium
+         partnum_str = "Cavium CN88XX";
++    } else if (implementer == 'p' && partnum == 0x661) {
++	//phytium
++	partnum_str = "ARM Cortex-a57";
+     }
+ 
+     snprintf(str, len, "%s r%up%u", partnum_str, variant, revision);
+diff --git a/kernel/dev/uart/8250/rules.mk b/kernel/dev/uart/8250/rules.mk
+new file mode 100644
+index 0000000..297313b
+--- /dev/null
++++ b/kernel/dev/uart/8250/rules.mk
+@@ -0,0 +1,17 @@
++# Copyright 2017 The Fuchsia Authors
++# Use of this source code is governed by a MIT-style
++# license that can be found in the LICENSE file or at
++# https://opensource.org/licenses/MIT
++
++LOCAL_DIR := $(GET_LOCAL_DIR)
++
++MODULE := $(LOCAL_DIR)
++
++MODULE_SRCS += \
++	$(LOCAL_DIR)/uart.c
++
++MODULE_DEPS += \
++	kernel/dev/pdev \
++	kernel/dev/pdev/uart \
++
++include make/module.mk
+diff --git a/kernel/dev/uart/8250/uart.c b/kernel/dev/uart/8250/uart.c
+new file mode 100644
+index 0000000..69adcdc
+--- /dev/null
++++ b/kernel/dev/uart/8250/uart.c
+@@ -0,0 +1,264 @@
++// Copyright 2016 The Fuchsia Authors
++// Copyright (c) 2014-2015 Travis Geiselbrecht
++//
++// Use of this source code is governed by a MIT-style
++// license that can be found in the LICENSE file or at
++// https://opensource.org/licenses/MIT
++
++#include <reg.h>
++#include <stdio.h>
++#include <trace.h>
++#include <arch/arm64/periphmap.h>
++#include <lib/cbuf.h>
++#include <kernel/thread.h>
++#include <dev/interrupt.h>
++#include <dev/uart.h>
++#include <platform/debug.h>
++#include <pdev/driver.h>
++#include <pdev/uart.h>
++#include <zircon/boot/driver-config.h>
++
++#define UARTREG(base, reg)  (*REG32((base)  + (reg)))
++
++#define RXBUF_SIZE 16
++
++/** @brief
++ * Offsets from base
++ */
++
++/** @brief DLAB 0 */
++#define RBR  (0x0)    ///< Rx Buffer Register (read)
++#define THR  (0x0)    ///< Tx Buffer Register (write)
++#define IER  (0x4)    ///< Interrupt Enable Register
++
++/** @brief DLAB X */
++#define IIR  (0x8)    ///< Interrupt Ident Register (read)
++#define FCR  (0x8)    ///< FIFO Control Register (write)
++#define LCR  (0xc)    ///< Line Control Register
++#define LSR  (0x14)   ///< Line Status Register
++#define USR  (0x7c)   ///< Scratch register
++
++/** @brief DLAB 1 */
++#define DLL  (0x0)    ///< Divisor Latch, LSB
++#define DLH  (0x4)    ///< Divisor Latch, MSB
++
++/** @brief
++ * Interrupt source definition via IIR
++ */
++#define MODEM_STATUS                            0
++#define NO_MORE_INTR                            1
++#define TRANSMITTER_HODING_REGISTER_EMPTY       2
++#define RECEIVER_DATA_AVAIL                     4
++#define RECEIVER_ERROR                          6
++#define CHARACTER_TIMEOUT_INDICATION            12
++
++/** @brief
++ * Bits definition of IER
++ */
++#define RECEIVE_ENABLE          0x1
++#define TRANSMIT_ENABLE         0x2
++#define RECEIVER_LINE_ST_ENABLE 0x4
++#define MODEM_ENABLE            0x8
++#define INTERRUPT_DISABLE       0x0
++
++/** @brief
++ * Bits definition of the Line Status Register (LSR)
++ */
++#define DR      0x01    ///< Data Ready
++#define OE      0x02    ///< Overrun Error
++#define PE      0x04    ///< Parity Error
++#define FE      0x08    ///< Framing Error
++#define BI      0x10    ///< Break Interrupt
++#define THRE    0x20    ///< Transmitter Holding Register Empty
++#define TEMT    0x40    ///< Transmitter Empty
++#define RFE     0x80    ///< Error receive Fifo
++
++/** @brief
++ * Bits definition of the MODEM Control Register (MCR)
++ */
++#define DTR     0x01    ///< Data Terminal Ready
++#define RTS     0x02    ///< Request To Send
++#define OUT_1   0x04    ///< Output 1, (reserved on COMPAQ I/O Board)
++#define OUT_2   0x08    ///< Output 2, Enable Asynchronous Port Interrupts
++#define LB      0x10    ///< Enable Internal Loop Back
++
++/** @brief
++ * Bits definition of the Line Control Register (LCR)
++ */
++#define CHR_5_BITS 0
++#define CHR_6_BITS 1
++#define CHR_7_BITS 2
++#define CHR_8_BITS 3
++
++#define WL      0x03    ///< Word length mask
++#define STB     0x04    ///< 1 Stop Bit, otherwise 2 Stop Bits
++#define PEN     0x08    ///< Parity Enabled
++#define EPS     0x10    ///< Even Parity Select, otherwise Odd
++#define SP      0x20    ///< Stick Parity
++#define BCB     0x40    ///< Break Control Bit
++#define DLAB    0x80    ///< Enable Divisor Latch Access
++
++/** @brief
++ * Bits definition of the MODEM Status Register (MSR)
++ */
++#define DCTS    0x01    ///< Delta Clear To Send
++#define DDSR    0x02    ///< Delta Data Set Ready
++#define TERI    0x04    ///< Trailing Edge Ring Indicator
++#define DDCD    0x08    ///< Delta Carrier Detect Indicator
++#define CTS     0x10    ///< Clear To Send (when loop back is active)
++#define DSR     0x20    ///< Data Set Ready (when loop back is active)
++#define RI      0x40    ///< Ring Indicator (when loop back is active)
++#define DCD     0x80    ///< Data Carrier Detect (when loop back is active)
++
++/** @brief
++ * Bits definition of the FIFO Control Register : WD16C552 or NS16550
++ */
++
++#define FIFO_CTRL   0x01    ///< Set to 1 permit access to other bits
++#define FIFO_EN     0x01    ///< Enable the FIFO
++#define XMIT_RESET  0x02    ///< Transmit FIFO Reset
++#define RCV_RESET   0x04    ///< Receive FIFO Reset
++#define DMA_MODE    0x08    ///< do not use this bit
++
++#define SEND_FIFO_TRIGGER1      0x0  ///< trigger send interrupt after 1 byte
++#define SEND_FIFO_TRIGGER4      0x10 ///< trigger send interrupt after 4 byte
++#define SEND_FIFO_TRIGGER8      0x20 ///< trigger send interrupt after 8 byte
++#define SEND_FIFO_TRIGGER12     0x30 ///< trigger send interrupt after 12 byte
++#define RECEIVE_FIFO_TRIGGER1   0x0  ///< trigger recieve interrupt after 1 byte
++#define RECEIVE_FIFO_TRIGGER4   0x40 ///< trigger recieve interrupt after 4 byte
++#define RECEIVE_FIFO_TRIGGER8   0x80 ///< trigger recieve interrupt after 8 byte
++#define RECEIVE_FIFO_TRIGGER12  0xc0 ///< trigger recieve interrupt after 12 byte
++#define TRIG_LEVEL              0xc0 ///< Mask for the trigger level
++
++
++// values read from zbi
++static vaddr_t uart_base = 0;
++static uint32_t uart_irq = 0;
++
++static cbuf_t uart_rx_buf;
++
++/*
++ * Tx driven irq:
++ * NOTE: For the p8250, txim is the "ready to transmit" interrupt. So we must
++ * mask it when we no longer care about it and unmask it when we start
++ * xmitting.
++ */
++static bool uart_tx_irq_enabled = false;
++static event_t uart_dputc_event = EVENT_INITIAL_VALUE(uart_dputc_event,
++                                                      true,
++                                                      EVENT_FLAG_AUTOUNSIGNAL);
++
++
++static inline void p8250_mask_tx(void)
++{
++    //UARTREG(uart_base, IER) &= ~(TRANSMIT_ENABLE);
++}
++
++static inline void p8250_unmask_tx(void)
++{
++    //UARTREG(uart_base, IER) |= (TRANSMIT_ENABLE);
++}
++
++static void p8250_uart_irq(void *arg)
++{
++}
++
++static void p8250_uart_init(const void* driver_data, uint32_t length)
++{
++    cbuf_initialize(&uart_rx_buf, RXBUF_SIZE);
++}
++
++static int p8250_uart_getc(bool wait)
++{
++    //char c;
++    //if (cbuf_read_char(&uart_rx_buf, &c, wait) == 1) {
++	//enable send intr and recv intr
++        //UARTREG(uart_base, IER) |= (RECEIVE_ENABLE|TRANSMIT_ENABLE); // rxim
++    //    return c;
++    //}
++    if ( wait )
++	while  ((UARTREG(uart_base, LSR) & DR) == 0) {};
++    if ((UARTREG(uart_base, LSR) & DR) == 1) {
++        return UARTREG(uart_base, RBR);
++    } else {
++        return ZX_ERR_INTERNAL;
++    }
++
++}
++
++/* panic-time getc/putc */
++static int p8250_uart_pputc(char c)
++{
++    /* spin while fifo is full */
++    while ((UARTREG(uart_base, LSR) & THRE) == 0)
++        ;
++    UARTREG(uart_base, THR) = c;
++
++    return 1;
++}
++
++static int p8250_uart_pgetc(void)
++{
++    if ((UARTREG(uart_base, LSR) & DR) == 1) {
++        return UARTREG(uart_base, RBR);
++    } else {
++        return -1;
++    }
++}
++
++static void p8250_dputs(const char* str, size_t len,
++                        bool block, bool map_NL)
++{
++    bool copied_CR = false;
++
++    //if (!uart_tx_irq_enabled)
++    //    block = false;
++    //else
++	//block = true;
++
++    while (len > 0) {
++        // Is FIFO Full ?
++        while ((UARTREG(uart_base, LSR) & THRE) == 0) {
++        };
++	//UARTREG(uart_base, THR) = 'A';
++	//return ;
++        if (!copied_CR && map_NL && *str == '\n') {
++            copied_CR = true;
++            UARTREG(uart_base, THR) = '\r';
++        } else {
++            copied_CR = false;
++            UARTREG(uart_base, THR) = *str++;
++            len--;
++        }
++    }
++}
++
++static void p8250_start_panic(void)
++{
++    uart_tx_irq_enabled = false;
++}
++
++static const struct pdev_uart_ops uart_ops = {
++    .getc = p8250_uart_getc,
++    .pputc = p8250_uart_pputc,
++    .pgetc = p8250_uart_pgetc,
++    .start_panic = p8250_start_panic,
++    .dputs = p8250_dputs,
++};
++
++static void p8250_uart_init_early(const void* driver_data, uint32_t length) {
++    ASSERT(length >= sizeof(dcfg_simple_t));
++    const dcfg_simple_t* driver = driver_data;
++    ASSERT(driver->mmio_phys && driver->irq);
++    uart_base = periph_paddr_to_vaddr(driver->mmio_phys);
++    ASSERT(uart_base);
++    uart_irq = driver->irq;
++
++    pdev_register_uart(&uart_ops);
++    p8250_dputs("8250_uart_init_early\n", 21, 0, 1);
++    //dprintf(INFO, "8250_uart_init_early success\n");
++    //dprintf(INFO, "8250_uart_init_early uart_base=0x%lx\n", uart_base);
++}
++
++LK_PDEV_INIT(p8250_uart_init_early, KDRV_8250_UART, p8250_uart_init_early, LK_INIT_LEVEL_PLATFORM_EARLY);
++LK_PDEV_INIT(p8250_uart_init, KDRV_8250_UART, p8250_uart_init, LK_INIT_LEVEL_PLATFORM);
+diff --git a/kernel/platform/generic-arm/rules.mk b/kernel/platform/generic-arm/rules.mk
+index fe2058d..2ac24dc 100644
+--- a/kernel/platform/generic-arm/rules.mk
++++ b/kernel/platform/generic-arm/rules.mk
+@@ -35,5 +35,6 @@ MODULE_DEPS += \
+ 	kernel/dev/uart/nxp-imx \
+ 	kernel/dev/uart/pl011 \
+ 	kernel/dev/hdcp/amlogic_s912 \
++	kernel/dev/uart/8250 \
+ 
+ include make/module.mk
+diff --git a/kernel/target/all-boards.list b/kernel/target/all-boards.list
+index 4335e3f..d97bd85 100644
+--- a/kernel/target/all-boards.list
++++ b/kernel/target/all-boards.list
+@@ -4,5 +4,6 @@ hikey960
+ qemu
+ vim2
+ imx8mevk
++ft1500hk
+ [x64]
+ pc
+diff --git a/kernel/target/arm64/board/ft1500hk/boot-shim-config.h b/kernel/target/arm64/board/ft1500hk/boot-shim-config.h
+new file mode 100644
+index 0000000..e727da6
+--- /dev/null
++++ b/kernel/target/arm64/board/ft1500hk/boot-shim-config.h
+@@ -0,0 +1,81 @@
++// Copyright 2018 The Fuchsia Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#define HAS_DEVICE_TREE 1
++
++static const zbi_cpu_config_t cpu_config = {
++    .cluster_count = 1,
++    .clusters = {
++        {
++            .cpu_count = 1,
++        },
++    },
++};
++
++static const zbi_mem_range_t mem_config[] = {
++    {
++        .type   = ZBI_MEM_RANGE_RAM,
++        .paddr  = 0x80000000, // from 2GB
++        .length = 0x80000000, // 2GB
++    },
++    {
++        .type   = ZBI_MEM_RANGE_PERIPHERAL,
++        .paddr  = 0x00000000,
++        .length = 0x80000000,
++    },
++
++};
++
++static const dcfg_simple_t uart_driver = {
++    .mmio_phys = 0x70001000,
++    .irq = 37,
++};
++
++static const dcfg_arm_gicv2_driver_t gicv2_driver = {
++    .mmio_phys = 0x71800000,
++    .gicd_offset = 0x1000,
++    .gicc_offset = 0x2000,
++    .gich_offset = 0x4000,
++    .gicv_offset = 0x5000,
++    .ipi_base = 12,
++};
++
++
++static const dcfg_arm_generic_timer_driver_t timer_driver = {
++    .irq_phys = 30,
++};
++
++static const dcfg_arm_psci_driver_t psci_driver = {
++    .use_hvc = true,
++};
++
++static const zbi_platform_id_t platform_id = {
++    .vid = PDEV_VID_TJFT,
++    .pid = PDEV_PID_TJFT_1500HK,
++    .board_name = "ft1500hk",
++};
++
++static void append_board_boot_item(zbi_header_t* bootdata) {
++    // add CPU configuration
++    append_boot_item(bootdata, ZBI_TYPE_CPU_CONFIG, 0, &cpu_config,
++                    sizeof(zbi_cpu_config_t) +
++                    sizeof(zbi_cpu_cluster_t) * cpu_config.cluster_count);
++
++    // add memory configuration
++    append_boot_item(bootdata, ZBI_TYPE_MEM_CONFIG, 0, &mem_config,
++                    sizeof(zbi_mem_range_t) * countof(mem_config));
++
++    // add kernel drivers
++    append_boot_item(bootdata, ZBI_TYPE_KERNEL_DRIVER, KDRV_8250_UART, &uart_driver,
++                    sizeof(uart_driver));
++    append_boot_item(bootdata, ZBI_TYPE_KERNEL_DRIVER, KDRV_ARM_GIC_V2, &gicv2_driver,
++                    sizeof(gicv2_driver));
++    append_boot_item(bootdata, ZBI_TYPE_KERNEL_DRIVER, KDRV_ARM_PSCI, &psci_driver,
++                    sizeof(psci_driver));
++    append_boot_item(bootdata, ZBI_TYPE_KERNEL_DRIVER, KDRV_ARM_GENERIC_TIMER, &timer_driver,
++                    sizeof(timer_driver));
++
++    // add platform ID
++    append_boot_item(bootdata, ZBI_TYPE_PLATFORM_ID, 0, &platform_id, sizeof(platform_id));
++}
+diff --git a/kernel/target/arm64/board/ft1500hk/boot.cmd b/kernel/target/arm64/board/ft1500hk/boot.cmd
+new file mode 100644
+index 0000000..2a13e78
+--- /dev/null
++++ b/kernel/target/arm64/board/ft1500hk/boot.cmd
+@@ -0,0 +1 @@
++setenv bootargs 'TERM=uart'; ext4load usb 0:1 0x90000000 dtb/u-boot-ft2000ahk.dtb; ext4load usb 0:1 0x80280000 ft1500hk-zircon-bootimage.bin.img; bootm 0x80280000 - 0x90000000
+diff --git a/kernel/target/arm64/board/ft1500hk/rules.mk b/kernel/target/arm64/board/ft1500hk/rules.mk
+new file mode 100644
+index 0000000..4935fdc
+--- /dev/null
++++ b/kernel/target/arm64/board/ft1500hk/rules.mk
+@@ -0,0 +1,24 @@
++# Copyright 2017 The Fuchsia Authors
++#
++# Use of this source code is governed by a MIT-style
++# license that can be found in the LICENSE file or at
++# https://opensource.org/licenses/MIT
++
++LOCAL_DIR := $(GET_LOCAL_DIR)
++
++PLATFORM_BOARD_NAME := ft1500hk
++PLATFORM_USE_SHIM := true
++
++include make/board.mk
++
++# prepend Linux header to kernel image
++
++HEADER_TOOL := $(LOCAL_DIR)/prepend-header.py
++KERNEL_LOAD_OFFSET := 0x10280000
++FT1500HK_KERNEL_IMAGE := $(BUILDDIR)/ft1500hk-zircon.bin
++FT1500HK_BOOT_SHIM := $(BUILDDIR)/ft1500hk-boot-shim.bin
++
++$(FT1500HK_KERNEL_IMAGE): $(HEADER_TOOL) $(KERNEL_ZBI) $(FT1500HK_BOOT_SHIM)
++	$(NOECHO)$(HEADER_TOOL) --kernel $(KERNEL_ZBI) --shim $(FT1500HK_BOOT_SHIM) --load_offset $(KERNEL_LOAD_OFFSET) --output $@
++
++EXTRA_KERNELDEPS += $(FT1500HK_KERNEL_IMAGE)
+diff --git a/kernel/target/arm64/board/odroidc2/prepend-header-old.py b/kernel/target/arm64/board/odroidc2/prepend-header-old.py
+new file mode 100755
+index 0000000..0c49e3c
+--- /dev/null
++++ b/kernel/target/arm64/board/odroidc2/prepend-header-old.py
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python
++# Copyright 2018 The Fuchsia Authors
++#
++# Use of this source code is governed by a MIT-style
++# license that can be found in the LICENSE file or at
++# https://opensource.org/licenses/MIT
++
++from argparse import ArgumentParser, FileType
++from os import fstat
++from struct import pack
++
++# The kernel assumes it is aligned to a 64K boundary
++HEADER_SIZE = 65536
++
++def filesize(f):
++    if f is None:
++        return 0
++    try:
++        return fstat(f.fileno()).st_size
++    except OSError:
++        return 0
++
++def parse_int(x):
++    return int(x, 0)
++
++def parse_cmdline():
++    parser = ArgumentParser()
++    parser.add_argument('--kernel', help='path to the kernel', type=FileType('rb'), required=True)
++    parser.add_argument('--load_offset', help='kernel load offset', type=parse_int, required=True)
++    parser.add_argument('-o', '--output', help='output file name', type=FileType('wb'), required=True)
++    return parser.parse_args()
++
++def pad_file(f, padding):
++    pad = (padding - (f.tell() & (padding - 1))) & (padding - 1)
++    f.write(pack(str(pad) + 'x'))
++
++def main():
++    args = parse_cmdline()
++    kernel = args.kernel
++    out = args.output
++    load_offset = args.load_offset
++    kernel_size = fstat(kernel.fileno()).st_size
++
++    # write our Linux compatible header
++    out.write(pack('I', 0x91005a4d))    # mrs	x19, mpidr_el1 ('MZ' magic)
++    out.write(pack('I', 0x14000000 + HEADER_SIZE / 4 - 1))    # branch to end of header
++    out.write(pack('Q', load_offset))
++    out.write(pack('Q', kernel_size))
++    out.write(pack('Q', 0))
++    out.write(pack('Q', 0))
++    out.write(pack('Q', 0))
++    out.write(pack('Q', 0))
++    out.write(pack('3s', 'ARM'))
++    out.write(pack('B', 0x64))
++
++    pad_file(out, HEADER_SIZE);
++
++    # followed by the kernel
++    out.write(kernel.read())
++
++if __name__ == '__main__':
++    main()
+diff --git a/kernel/target/arm64/boot-shim/boot-shim.S b/kernel/target/arm64/boot-shim/boot-shim.S
+index 14839af..cbf4863 100644
+--- a/kernel/target/arm64/boot-shim/boot-shim.S
++++ b/kernel/target/arm64/boot-shim/boot-shim.S
+@@ -17,10 +17,28 @@ tmp             .req x16
+ 
+ #define STACK_SIZE  4096
+ 
++//#define UART_OUT 0x70001000
++#define UART_OUT 0xc81004c0
++
+ .section .text.boot0,"ax"
+ FUNCTION(_start)
+     // x0 typically points to device tree at entry
+-
++    //ldr x0, =0x9000000
++    //ldr x8, =UART_OUT
++    //mov x7, #0x68
++    //str x7, [x8]
++    //mov x7, #0x65
++    //str x7, [x8]
++    //mov x7, #0x6c
++    //str x7, [x8]
++    //mov x7, #0x6c
++    //str x7, [x8]
++    //mov x7, #0x6f
++    //str x7, [x8]
++    //mov x7, #0xa
++    //str x7, [x8]
++    //mov x7, #0xd
++    //str x7, [x8]
+    // what EL are we running at?
+     mrs     tmp, CurrentEL
+     cmp     tmp, #(1 << 2)
+@@ -43,13 +61,14 @@ cache_disable_el1:
+     msr     sctlr_el1, tmp
+ 
+ cache_disable_done:
++    //bl      uart_puts_hello
+     // setup stack
+     adr     tmp, stack_end
+     mov     sp, tmp
+ 
+     // x0: pointer to device tree
+-    bl      boot_shim
+ 
++    bl      boot_shim
+     // x0: bootdata_t* to pass to kernel
+     // x1: kernel entry point
+     br      x1
+diff --git a/kernel/target/arm64/boot-shim/boot-shim.c b/kernel/target/arm64/boot-shim/boot-shim.c
+index 09ab3bc..6ada090 100644
+--- a/kernel/target/arm64/boot-shim/boot-shim.c
++++ b/kernel/target/arm64/boot-shim/boot-shim.c
+@@ -20,7 +20,8 @@
+ 
+ // Uncomment to list ZBI items.
+ #ifndef PRINT_ZBI
+-#define PRINT_ZBI 0
++//#define PRINT_ZBI 0
++#define PRINT_ZBI 1
+ #endif
+ 
+ // used in boot-shim-config.h and in this file below
+@@ -226,24 +227,37 @@ static void list_zbi(zbi_header_t* zbi) {
+ }
+ 
+ boot_shim_return_t boot_shim(void* device_tree) {
+-    uart_puts("boot_shim: hi there!\n");
++    uart_puts("boot_shim: hi there!");
++    uart_print_hex((uintptr_t)device_tree);
++    uart_puts("\n");
++    
++    uart_puts("embedded_zbi=0x");
++    uart_print_hex((uintptr_t)&embedded_zbi);
++    uart_puts("\n");
+ 
+-    zircon_kernel_t* kernel = NULL;
+ 
++    zircon_kernel_t* kernel = NULL;
++    
+     // Check the ZBI from device tree.
+     device_tree_context_t ctx;
+     zbi_header_t* zbi = read_device_tree(device_tree, &ctx);
+     if (zbi != NULL) {
++        uart_puts("read_device_tree zbi is not NULL\n");
+         zbi_header_t* bad_hdr;
+         zbi_result_t check = zbi_check(zbi, &bad_hdr);
+         if (check == ZBI_RESULT_OK && zbi->length > sizeof(zbi_header_t) &&
+             zbi[1].type == ZBI_TYPE_KERNEL_ARM64) {
+             kernel = (zircon_kernel_t*) zbi;
++            uart_puts("kernel is assigned from zbi\n");
++    	    uart_puts("Kernel at ");
++    	    uart_print_hex((uintptr_t)kernel);
+         } else {
+             // No valid ZBI in device tree.
+             // We will look in embedded_zbi instead.
+             zbi = NULL;
+         }
++    } else {
++        uart_puts("read_device_tree zbi is NULL\n");
+     }
+ 
+     // If there is a complete ZBI from device tree, ignore whatever might
+diff --git a/kernel/target/arm64/boot-shim/debug.c b/kernel/target/arm64/boot-shim/debug.c
+index 7b6adc5..a764c46 100644
+--- a/kernel/target/arm64/boot-shim/debug.c
++++ b/kernel/target/arm64/boot-shim/debug.c
+@@ -8,14 +8,20 @@
+ // #define QEMU_PRINT 1
+ // #define HIKEY960_PRINT 1
+ // #define VIM2_PRINT 1
++ #define FT1500HK_PRINT 1
+ 
+ #if QEMU_PRINT
+ static volatile uint32_t* uart_fifo_dr = (uint32_t *)0x09000000;
+ static volatile uint32_t* uart_fifo_fr = (uint32_t *)0x09000018;
+-#elif HIKEY960_PRINT
++#endif
++#if HIKEY960_PRINT
+ static volatile uint32_t* uart_fifo_dr = (uint32_t *)0xfff32000;
+ static volatile uint32_t* uart_fifo_fr = (uint32_t *)0xfff32018;
+ #endif
++#if FT1500HK_PRINT
++static volatile uint32_t* uart_fifo_dr = (uint32_t *)0x70001000;
++static volatile uint32_t* uart_fifo_fr = (uint32_t *)0x70001014;
++#endif
+ 
+ #if QEMU_PRINT || HIKEY960_PRINT
+ static void uart_pputc(char c)
+@@ -27,6 +33,16 @@ static void uart_pputc(char c)
+ }
+ #endif
+ 
++#if FT1500HK_PRINT
++static void uart_pputc(char c)
++{
++    /* spin while fifo is full */
++    while (!(*uart_fifo_fr & (1<<5)))
++        ;
++    *uart_fifo_dr = c;
++}
++#endif
++
+ #if VIM2_PRINT
+ static volatile uint32_t* uart_wfifo = (uint32_t *)0xc81004c0;
+ static volatile uint32_t* uart_status = (uint32_t *)0xc81004cc;
+@@ -40,11 +56,13 @@ static void uart_pputc(char c)
+ }
+ #endif
+ 
+-#if QEMU_PRINT || HIKEY960_PRINT || VIM2_PRINT
++#if QEMU_PRINT || HIKEY960_PRINT || VIM2_PRINT || FT1500HK_PRINT
+ void uart_puts(const char* str) {
+     char ch;
+     while ((ch = *str++)) {
+         uart_pputc(ch);
++	if (ch == '\n')
++    	    uart_pputc('\r');
+     }
+ }
+ 
+diff --git a/scripts/build-bootable-odroidc2-sdcard.sh b/scripts/build-bootable-odroidc2-sdcard.sh
+index bde8eab..914c878 100755
+--- a/scripts/build-bootable-odroidc2-sdcard.sh
++++ b/scripts/build-bootable-odroidc2-sdcard.sh
+@@ -27,9 +27,10 @@ echo $ZIRCON_DIR
+ 
+ # Ensure Zircon has been built prior to formatting USB
+ pushd "$ZIRCON_DIR" > /dev/null
+-./scripts/build-zircon-arm64
++./scripts/build-zircon-arm64 V=1
+ popd > /dev/null
+-
++echo regenerate build-arm64/odroidc2-zircon.bin from ./build-arm64/odroidc2-zircon-bootimage.bin
++kernel/target/arm64/board/odroidc2/prepend-header-old.py --kernel ./build-arm64/odroidc2-zircon-bootimage.bin  --load_offset 0x10280000 --output build-arm64/odroidc2-zircon-new.bin
+ lsblk
+ echo "Enter the name of a block device to format: "
+ echo "     This will probably be of the form 'sd[letter]', like 'sdc'"
+@@ -84,9 +85,9 @@ echo " SUCCESS"
+ sudo -v -p "[sudo] Enter password to confirm information about device: "
+ sudo sfdisk -l "$DEVICE_PATH"
+ echo "[format_sdcard] ABOUT TO COMPLETELY WIPE / FORMAT: $DEVICE_PATH"
+-get_confirmation
++#get_confirmation
+ echo "[format_sdcard] ARE YOU 100% SURE? This will hurt if you get it wrong."
+-get_confirmation
++#get_confirmation
+ 
+ # Create three new partitions on the device, 1GB for root and divide the
+ # remaining space into 2 pieces for data and bootfs
+@@ -150,8 +151,8 @@ curl -L http://dn.odroid.com/S905/BootLoader/ODROID-C2/c2_boot_release_fuchsia.t
+ tar -C /tmp -xzf /tmp/sd.tgz
+ 
+ # Copy the kernel to the boot partition.
+-sudo cp "$ZIRCON_DIR/build-arm64/odroidc2-zircon.bin" \
+-        "${MOUNT_PATH}/"
++sudo cp "$ZIRCON_DIR/build-arm64/odroidc2-zircon-new.bin" \
++        "${MOUNT_PATH}/odroidc2-zircon.bin"
+ 
+ # Copy the ramdisk
+ sudo cp "$ZIRCON_DIR/build-arm64/odroidc2-bootdata.bin" \
+diff --git a/scripts/flash-hikey b/scripts/flash-hikey
+index 515d1d7..c8e78e4 100755
+--- a/scripts/flash-hikey
++++ b/scripts/flash-hikey
+@@ -63,12 +63,12 @@ flash_firmware() {
+     fi
+ 
+     help_fastboot
+-    fastboot flash ptable ${FIRMWARE_DIR}/installer/hikey960/ptable.img
+-    fastboot flash xloader ${FIRMWARE_DIR}/installer/hikey960/sec_xloader.img
+-    fastboot flash fastboot ${FIRMWARE_DIR}/installer/hikey960/fastboot.img
+-    fastboot flash nvme ${FIRMWARE_DIR}/installer/hikey960/nvme.img
+-    fastboot flash fw_lpm3 ${FIRMWARE_DIR}/installer/hikey960/lpm3.img
+-    fastboot flash trustfirmware ${FIRMWARE_DIR}/installer/hikey960/bl31.bin
++    sudo fastboot flash ptable ${FIRMWARE_DIR}/installer/hikey960/ptable.img
++    sudo fastboot flash xloader ${FIRMWARE_DIR}/installer/hikey960/sec_xloader.img
++    sudo fastboot flash fastboot ${FIRMWARE_DIR}/installer/hikey960/fastboot.img
++    sudo fastboot flash nvme ${FIRMWARE_DIR}/installer/hikey960/nvme.img
++    sudo fastboot flash fw_lpm3 ${FIRMWARE_DIR}/installer/hikey960/lpm3.img
++    sudo fastboot flash trustfirmware ${FIRMWARE_DIR}/installer/hikey960/bl31.bin
+ }
+ 
+ flash_kernel() {
+@@ -81,12 +81,21 @@ flash_kernel() {
+         --tags_offset $DT_OFFSET \
+         --cmdline "${CMDLINE}" \
+         -o $OUT_IMAGE
++    echo "${MKBOOTIMG}" \
++        --kernel $KERNEL \
++        --kernel_offset $KERNEL_OFFSET \
++        --base $MEMBASE \
++        --ramdisk_offset $RAMDISK_OFFSET \
++        --ramdisk "${RAMDISK}" \
++        --tags_offset $DT_OFFSET \
++        --cmdline "${CMDLINE}" \
++        -o $OUT_IMAGE
+ 
+-    fastboot flash boot $OUT_IMAGE
++    sudo fastboot flash boot $OUT_IMAGE
+     # Can't guarantee that the target has written image to flash before the
+     # fastboot command completes, so short delay here before reboot.
+     sleep 1
+-    fastboot reboot
++    sudo fastboot reboot
+ }
+ 
+ while getopts "b:d:fmnp:ruh" FLAG; do
+diff --git a/system/public/zircon/boot/driver-config.h b/system/public/zircon/boot/driver-config.h
+index 86ad415..0dee430 100644
+--- a/system/public/zircon/boot/driver-config.h
++++ b/system/public/zircon/boot/driver-config.h
+@@ -17,6 +17,7 @@
+ #define KDRV_NXP_IMX_UART       0x55584D49  // 'IMXU'
+ #define KDRV_HISILICON_POWER    0x4F505348  // 'HSPO'
+ #define KDRV_AMLOGIC_HDCP       0x484C4D41  // 'AMLH'
++#define KDRV_8250_UART          0x30353238  // '8250'
+ 
+ // kernel driver struct that can be used for simple drivers
+ // used by KDRV_PL011_UART, KDRV_AMLOGIC_UART and KDRV_NXP_IMX_UART
+diff --git a/system/ulib/ddk/include/ddk/protocol/platform-defs.h b/system/ulib/ddk/include/ddk/protocol/platform-defs.h
+index 1bb7f15..1ade7f8 100644
+--- a/system/ulib/ddk/include/ddk/protocol/platform-defs.h
++++ b/system/ulib/ddk/include/ddk/protocol/platform-defs.h
+@@ -110,4 +110,6 @@ __BEGIN_CDECLS;
+ #define PDEV_PID_AMS_TCS3400        1
+ #define PDEV_DID_AMS_LIGHT          1
+ 
++#define PDEV_VID_TJFT		    11
++#define PDEV_PID_TJFT_1500HK	    1
+ __END_CDECLS;
