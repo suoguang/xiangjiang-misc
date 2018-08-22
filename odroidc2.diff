@@ -1,0 +1,14 @@
+diff --git a/kernel/platform/generic-arm/platform.cpp b/kernel/platform/generic-arm/platform.cpp
+index a078be2..d0f25dc 100644
+--- a/kernel/platform/generic-arm/platform.cpp
++++ b/kernel/platform/generic-arm/platform.cpp
+@@ -536,7 +536,8 @@ size_t platform_recover_crashlog(size_t len, void* cookie,
+                                  void (*func)(const void* data, size_t, size_t len, void* cookie)) {
+     size_t max = lastlog_nvram.length - sizeof(log_hdr_t);
+     void* nvram = paddr_to_physmap(lastlog_nvram.base);
+-    if (nvram == NULL) {
++    dprintf(INFO, "addr of base=0x%lx nvram=0x%lx\n", lastlog_nvram.base, (uintptr_t)nvram);
++    if ((nvram == NULL)||(lastlog_nvram.base == 0)) {
+         return 0;
+     }
+     log_hdr_t hdr;
