@@ -1,0 +1,2 @@
+setenv bootargs 'TERM=uart'; ext4load usb 0:1 0x90000000 dtb/u-boot-ft2000ahk.dtb; ext4load usb 0:1 0x80280000 ft1500hk-zircon-bootimage.bin.img; bootm 0x80280000 - 0x90000000
+
